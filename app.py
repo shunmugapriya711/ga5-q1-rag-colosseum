@@ -355,12 +355,32 @@ class Query(BaseModel):
     top_k: int = 3
 
 
+import time
+from collections import deque
+
+LOG = deque(maxlen=200)  # recent requests, viewable at GET /log (for tuning against the gauntlet)
+
+
 @app.post("/query")
 def query(q: Query):
     try:
-        return answer_query(q.question, q.top_k)
-    except Exception:
-        return abstain()
+        res = answer_query(q.question, q.top_k)
+    except Exception as e:  # never fail the request
+        res = abstain()
+        res_err = repr(e)
+    else:
+        res_err = None
+    entry = {"t": time.strftime("%H:%M:%S"), "question": q.question, "top_k": q.top_k, "response": res}
+    if res_err:
+        entry["error"] = res_err
+    LOG.append(entry)
+    print("QUERY", json.dumps(entry, ensure_ascii=False), flush=True)
+    return res
+
+
+@app.get("/log")
+def get_log():
+    return list(LOG)
 
 
 @app.get("/")
