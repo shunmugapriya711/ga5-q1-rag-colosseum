@@ -156,13 +156,14 @@ def sanitize(question: str) -> str:
 # ---------------------------------------------------------------- index
 PASSAGES = json.loads(KB_PATH.read_text(encoding="utf-8"))
 N = len(PASSAGES)
-_model = TextEmbedding(MODEL_NAME)
+# threads=1 + small batches keep peak RAM ~250MB (default settings exceed Render's 512MB free tier)
+_model = TextEmbedding(MODEL_NAME, threads=int(os.environ.get("EMBED_THREADS", "1")))
 _lock = threading.Lock()
 
 
 def embed(texts):
     with _lock:
-        v = np.array(list(_model.embed(list(texts))), dtype=np.float32)
+        v = np.array(list(_model.embed(list(texts), batch_size=8)), dtype=np.float32)
     return v / np.linalg.norm(v, axis=1, keepdims=True)
 
 
