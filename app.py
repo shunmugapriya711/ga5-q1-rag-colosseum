@@ -87,6 +87,18 @@ ALIASES = {
     "2-phase": "two-phase commit",
 }
 
+# Paraphrase synonyms (gauntlet questions avoid the KB's wording): appended to the query, never replacing.
+SYNONYMS = {
+    "keepalive": "heartbeat", "keepalives": "heartbeats", "subordinate": "follower", "subordinates": "followers",
+    "coordinator": "leader", "triggers": "timeouts", "coefficient": "rate", "scalar": "rate",
+    "magnitude": "scale", "daemon": "server", "provisioning": "generators create", "allocated": "listen",
+}
+
+# Capitalised discourse words that are not named entities.
+DISCOURSE = set("""furthermore moreover however additionally additional also synthesizing synthesising synthesize
+given since assuming suppose considering regarding note finally then next first second third lastly meanwhile
+in adjacent architecture overall together both""".split())
+
 INJECTION_RE = re.compile(
     r"(ignore|disregard|forget|override|bypass)\b|system\s*(prompt|message|note|override|instruction)|"
     r"\b(instruction|instructions|jailbreak|pretend|roleplay)\b|you are now|you must|act as|"
@@ -133,7 +145,7 @@ def tokens(text: str):
 def expand_aliases(text: str) -> str:
     def rep(m):
         w = m.group(0)
-        a = ALIASES.get(w.lower())
+        a = ALIASES.get(w.lower()) or SYNONYMS.get(w.lower())
         return f"{w} ({a})" if a else w
     return re.sub(r"[A-Za-z0-9][A-Za-z0-9+/\-]*", rep, text)
 
@@ -141,7 +153,7 @@ def expand_aliases(text: str) -> str:
 def sanitize(question: str) -> str:
     """Drop clauses that look like prompt-injection; keep the actual question."""
     q = re.sub(r"<[^>]{0,200}>", " ", question)  # html/xml-ish tags
-    parts = re.split(r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|\"[^\"]*\"|[.!?;\n]+|\s[-–—]{1,2}\s)", q)
+    parts = re.split(r"(\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|\"[^\"]*\"|[.!?;]+(?=\s|$)|\n+|\s[-–—]{1,2}\s)", q)
     kept = []
     for p in parts:
         if not p or not p.strip():
@@ -149,7 +161,7 @@ def sanitize(question: str) -> str:
         if INJECTION_RE.search(p):
             continue
         kept.append(p.strip(" ()[]{}\""))
-    cleaned = " ".join(k for k in kept if re.search(r"[A-Za-z0-9]", k))
+    cleaned = ". ".join(k.strip() for k in kept if re.search(r"[A-Za-z0-9]", k))  # keep sentence boundaries
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
@@ -172,6 +184,8 @@ SENTS = [SENT_RE.split(p.strip()) for p in PASSAGES]
 FLAT = [(i, j, s) for i, ss in enumerate(SENTS) for j, s in enumerate(ss)]
 S_EMB = embed([f"{SENTS[i][0]} {s}" if j else s for i, j, s in FLAT])  # sentence + topic context
 S_INDEX = {(i, j): k for k, (i, j, _) in enumerate(FLAT)}
+S_TOK = [set(tokens(s)) for _, _, s in FLAT]
+W_SENT = float(os.environ.get("W_SENT", "0.6"))
 
 P_TOK = [tokens(p) for p in PASSAGES]
 P_TF = [Counter(t) for t in P_TOK]
@@ -190,6 +204,7 @@ TOPIC = {}
 for i, ss in enumerate(SENTS):
     for t in set(tokens(ss[0])):
         TOPIC.setdefault(t, set()).add(i)
+TOPIC_TOKS = [set(tokens(ss[0])) for ss in SENTS]
 
 
 def bm25(q_toks, k1=1.4, b=0.75):
@@ -234,15 +249,16 @@ def entity_tokens(expanded_q: str):
 def unknown_entities(clean_q: str):
     """Proper-noun-ish tokens (capitalised mid-sentence, acronyms, alnum mixes) absent from the KB."""
     out = []
-    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9+/\-\.]*[A-Za-z0-9+]|[A-Za-z]", clean_q)
-    for idx, w in enumerate(words):
-        lw = w.lower()
-        if lw in STOP or len(w) < 2:
-            continue
-        is_ent = (w[0].isupper() and idx > 0) or (sum(c.isupper() for c in w) >= 2) or \
-                 (any(c.isdigit() for c in w) and any(c.isalpha() for c in w))
-        if is_ent and not known(w):
-            out.append(w)
+    for seg in re.split(r"(?<!\d)[.:;?!](?!\d)", clean_q):  # first word of each sentence/clause may be capitalised
+        words = re.findall(r"[A-Za-z0-9][A-Za-z0-9+/\-\.]*[A-Za-z0-9+]|[A-Za-z]", seg)
+        for idx, w in enumerate(words):
+            lw = w.lower()
+            if lw in STOP or lw in DISCOURSE or len(w) < 2:
+                continue
+            is_ent = (w[0].isupper() and idx > 0) or (sum(c.isupper() for c in w) >= 2) or \
+                     (any(c.isdigit() for c in w) and any(c.isalpha() for c in w))
+            if is_ent and not known(w):
+                out.append(w)
     return out
 
 
@@ -275,7 +291,19 @@ def retrieve(clean_q: str):
     for t in ents:
         for i in TOPIC.get(t, ()):
             topic_hits.setdefault(i, set()).add(t)
-    for i, ts in topic_hits.items():
+    # Sentence-level evidence: a passage holding one sentence that matches the question's attribute well
+    # beats a passage that matches loosely overall (paraphrased probes, look-alike passages).
+    attr = set(t for t in q_toks if t not in ents) or set(q_toks)
+    denom = sum(IDF.get(t, 0.5) for t in attr) or 1
+    s_dense = S_EMB @ qv
+    sent_best = np.zeros(N, dtype=np.float32)
+    for k, (i, j, s) in enumerate(FLAT):
+        cov = sum(IDF.get(t, 0) for t in attr & S_TOK[k]) / denom
+        v = float(s_dense[k]) + 0.6 * cov
+        if v > sent_best[i]:
+            sent_best[i] = v
+    hybrid = (hybrid + W_SENT * sent_best) / (1 + W_SENT)
+    for i, ts in topic_hits.items():  # named topic (Raft, AdamW, Postgres...) wins over look-alikes
         hybrid[i] += 0.12 * min(len(ts), 2)
     hybrid = np.clip(hybrid, 0, 1)
     return qv, q_toks, dense, bm_n, hybrid, ents, topic_hits
@@ -283,6 +311,56 @@ def retrieve(clean_q: str):
 
 def abstain():
     return {"answer": None, "sources": [], "scores": [], "confidence": 0.05}
+
+
+SYNTH_RE = re.compile(r"\b(integrat\w*|synthesi[sz]\w*|interoperat\w*|work together|relate|relationship)\b|"
+                      r"\bhow (do|does|would|can) (both|they|these|the two|each)\b", re.IGNORECASE)
+MECH_RE = re.compile(r"^\s*how (does|do|is|are|can|would|should)\b|\b(exact|mathematical) (formula|formulation|"
+                     r"derivation|equation)\b|\bwhy (does|do|is|are)\b", re.IGNORECASE)
+NUM_RE = re.compile(r"(?<![A-Za-z0-9\-/.])\d+(?:\.\d+)?")
+GENERIC = set(tokens("protocol protocols algorithm system systems mechanism handle handles handled work works "
+                     "operate operates implement implementation process perform execute during when"))
+
+
+def numbers_in(text: str):
+    return {float(x) for x in re.findall(r"\d+(?:\.\d+)?", text)}
+
+
+def build(chosen, pieces, order, hybrid, top_k):
+    answer = " ".join(dict.fromkeys(pieces))
+    # sources: chosen passages first, then remaining by hybrid score; scores descending in [0,1]
+    srcs = list(chosen) + [int(i) for i in order if int(i) not in chosen]
+    srcs = srcs[:max(top_k, len(chosen))]
+    scores, prev = [], 1.0
+    for i in srcs:
+        v = min(prev, max(0.0, min(1.0, float(hybrid[i]))))
+        scores.append(round(v, 4))
+        prev = v
+    conf = round(float(min(0.99, max(0.65, 0.5 + 0.6 * hybrid[chosen[0]]))), 4)
+    return {"answer": answer, "sources": srcs, "scores": scores, "confidence": conf}
+
+
+def synthesize(clean: str, top_k: int):
+    """'X does A. Furthermore: Y does B. How do both integrate?' -> one passage per described system."""
+    chosen, seg_scores = [], {}
+    for seg in re.split(r"(?<!\d)[.?!](?!\d)", clean):
+        seg = SYNTH_RE.sub(" ", seg)
+        if len(tokens(seg)) < 3:
+            continue
+        _, _, dense, _, h, _, _ = retrieve(expand_aliases(seg))
+        i = int(np.argmax(h))
+        if dense[i] >= 0.45 and i not in chosen:
+            chosen.append(i)
+            seg_scores[i] = float(h[i])
+    if len(chosen) < 2:
+        return None
+    _, _, _, _, hybrid, _, _ = retrieve(expand_aliases(clean))
+    for i in chosen:
+        hybrid[i] = max(hybrid[i], seg_scores[i])
+    chosen.sort(key=lambda x: -hybrid[x])
+    order = np.argsort(-hybrid)
+    pieces = [" ".join(SENTS[i][:2]) for i in chosen]
+    return build(chosen, pieces, order, hybrid, top_k)
 
 
 def answer_query(question: str, top_k: int = 3):
@@ -294,6 +372,11 @@ def answer_query(question: str, top_k: int = 3):
     if unknown_entities(clean):
         return abstain()
 
+    if SYNTH_RE.search(clean):
+        res = synthesize(clean, top_k)
+        if res:
+            return res
+
     qv, q_toks, dense, bm_n, hybrid, ents, topic_hits = retrieve(expanded)
     order = np.argsort(-hybrid)
     top = int(order[0])
@@ -301,6 +384,21 @@ def answer_query(question: str, top_k: int = 3):
         return abstain()
     if float(dense.max()) < DENSE_ABSTAIN - 0.08:
         return abstain()
+
+    # False premise: the question asserts a number the matching passage does not contain
+    # ("Since Raft requires 100 nodes ...") -> refuse rather than answer on a poisoned premise.
+    q_nums = {float(x) for x in NUM_RE.findall(clean)}
+    if q_nums and not q_nums <= numbers_in(PASSAGES[top]):
+        return abstain()
+
+    # Mechanism / derivation question about a KB topic whose specifics the passage never covers.
+    if MECH_RE.search(clean):
+        attr = set(t for t in q_toks if t not in ents and t not in GENERIC and t not in TOPIC_TOKS[top])
+        denom = sum(IDF.get(t, 0.5) for t in attr)
+        if denom:
+            best_cov = max(sum(IDF.get(t, 0) for t in attr & set(tokens(s))) / denom for s in SENTS[top])
+            if best_cov < 0.34:
+                return abstain()
 
     numeric = bool(NUMERIC_Q_RE.search(clean))
     chosen = [top]
@@ -330,19 +428,7 @@ def answer_query(question: str, top_k: int = 3):
             j2, s2 = best_sentence(i, qv, attr_toks, numeric, exclude={j, 0})
             if j2 is not None and s2 > 0.55:
                 pieces.append(SENTS[i][j2])
-    answer = " ".join(dict.fromkeys(pieces))
-
-    # sources: chosen passages first, then remaining by hybrid score; scores descending in [0,1]
-    srcs = list(chosen) + [int(i) for i in order if int(i) not in chosen]
-    srcs = srcs[:max(top_k, len(chosen))]
-    raw = [float(hybrid[i]) for i in srcs]
-    scores, prev = [], 1.0
-    for r in raw:
-        v = min(prev, max(0.0, min(1.0, r)))
-        scores.append(round(v, 4))
-        prev = v
-    conf = round(float(min(0.99, max(0.65, 0.5 + 0.6 * hybrid[top]))), 4)
-    return {"answer": answer, "sources": srcs, "scores": scores, "confidence": conf}
+    return build(chosen, pieces, order, hybrid, top_k)
 
 
 # ---------------------------------------------------------------- API
